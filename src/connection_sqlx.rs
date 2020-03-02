@@ -8,11 +8,27 @@ use pyo3::types::{PyList, PyTuple};
 
 use crate::{deserialize_bytes_via_python, executor};
 
+#[cfg(feature = "cheating")]
+use std::collections::HashMap;
+#[cfg(feature = "cheating")]
+use std::sync::Mutex;
+
 /// An asynchronous PG driver using `sqlx` with the "slonik-rt" async runtime bridge
 /// to python's `asyncio`.
+#[cfg(not(feature = "cheating"))]
 #[pyclass]
 pub struct SqlxConnection {
     pool: *const PgPool,
+}
+
+/// An asynchronous PG driver using `sqlx` with the "slonik-rt" async runtime bridge
+/// to python's `asyncio`. 
+/// Contains a terrible infinitely growing cache to see how caching affects benchmarks.
+#[cfg(feature = "cheating")]
+#[pyclass]
+pub struct SqlxConnection {
+    pool: *const PgPool,
+    cache: Arc<Mutex<HashMap<&'static str, PyObject>>>,
 }
 
 impl Drop for SqlxConnection {
@@ -37,7 +53,16 @@ impl SqlxConnection {
         let pool = executor::block_on(pool).expect("Building pg connection pool failed");
         let pool = Arc::into_raw(Arc::new(pool));
 
-        SqlxConnection { pool }
+        #[cfg(not(feature = "cheating"))]
+        {
+            SqlxConnection { pool }
+        }
+
+        #[cfg(feature = "cheating")]
+        {
+            let cache = Arc::new(Mutex::new(HashMap::default()));
+            SqlxConnection { pool, cache }
+        }
     }
 
     /// Spawns an async task to execute the given SQL query, bridged to python via 
@@ -45,13 +70,24 @@ impl SqlxConnection {
     /// As `sqlx` doesn't yet provide a way to access the query's result column types,
     /// the client has to provide them via the `columns` vec.
     fn query(
-        &self,
+        &mut self,
         query: &'static str,
         columns: Vec<String>,
         on_done_callback: PyObject,
         read_registrar: PyObject,
         write_registrar: PyObject,
     ) {
+        {
+            #[cfg(feature = "cheating")]
+            {
+                let cache = self.cache.lock().unwrap();
+                if let Some(rows) = cache.get(query) {
+                    slonik_rt::execute_python_callback(&on_done_callback, rows);
+                    return;
+                }
+            }
+        }
+
         let pool = {
             let pool = unsafe { Arc::from_raw(self.pool) };
             let clone = Arc::clone(&pool);
@@ -59,12 +95,45 @@ impl SqlxConnection {
             clone
         };
 
-        executor::spawn_for_python(
-            do_query(pool, query, columns),
-            on_done_callback,
-            read_registrar,
-            write_registrar,
-        );
+        #[cfg(not(feature = "cheating"))]
+        {
+            let fut = do_query(pool, query, columns);
+            executor::spawn_for_python(
+                fut,
+                on_done_callback,
+                read_registrar,
+                write_registrar,
+            );
+        }
+
+        #[cfg(feature = "cheating")]
+        {
+            let cache = Arc::clone(&self.cache);
+
+            let fut = async move {
+                let rows = do_query(pool, query, columns).await;
+
+                let gil = Python::acquire_gil();
+                let py = gil.python();
+
+                let rows = rows.to_object(py);
+                let clone = rows.clone_ref(py);
+
+                {
+                    let mut cache = cache.lock().unwrap();
+                    cache.insert(query, rows);
+                }
+
+                clone
+            };
+
+            executor::spawn_for_python(
+                fut,
+                on_done_callback,
+                read_registrar,
+                write_registrar,
+            );
+        }        
     }
 }
 
