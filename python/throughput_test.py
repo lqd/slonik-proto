@@ -100,13 +100,13 @@ dsn = 'postgresql://postgres@localhost:5433/slonik_test'
 duration_in_seconds = 1
 
 # Sometimes, depending on the run order, or the queries executed above, asyncpg performance on this
-# benchmark can x3. Maybe it's because asyncpg maintains a LRU cache for queries. 
+# benchmark can x3. Maybe it's because asyncpg maintains a LRU cache (eg for prepared statements) ? 
 # I thought it could also be some postgres behaviour, as executing SELECT generate_series(1, 10000)
 # with slonik will make asyncpg run SELECT 1::int2 at 3x the throughput, but it doesn't happen when
 # the drivers are ran in the inverse order. So maybe the LRU cache or a silly bug in the benchmark.
 # For now, I'll leave asyncpg first, but I don't even know if running it as-is isn't already taking
-# advantage of the cache. Of course, adding a cache to slonik here would also be cheating, and 
-# easily multiply throughput 8-10x depending on the query.
+# advantage of the cache. Of course, adding a cache to slonik here would be cheating this benchmark,
+# and easily multiply throughput 8-10x depending on the query.
 drivers = [
     'asyncpg',
     'slonik-async',
